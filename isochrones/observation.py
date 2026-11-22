@@ -21,7 +21,7 @@ if not on_rtd:
     except ImportError:  # Python 3
         imap = map
         izip = zip
-        xrange = range
+        xrange = range  # noqa
 
     LOG_ONE_OVER_ROOT_2PI = np.log(1.0 / np.sqrt(2 * np.pi))
 else:
@@ -625,7 +625,7 @@ class Observation(object):
         self.band = band
         self.resolution = resolution
         if sources is not None:
-            if not np.all(type(s) == Source for s in sources):
+            if not all(type(s) == Source for s in sources):
                 raise ValueError("Source list must be all Source objects.")
 
         self.sources = []
@@ -843,29 +843,23 @@ class ObservationTree(Node):
         """
 
         if os.path.exists(filename):
-            store = pd.HDFStore(filename)
-            if path in store:
-                store.close()
+            with pd.HDFStore(filename, mode="r") as store:
+                exists = path in store
+            if exists:
                 if overwrite:
                     os.remove(filename)
                 elif not append:
-                    raise IOError(
-                        "{} in {} exists.  Set either overwrite or append option.".format(path, filename)
-                    )
-            else:
-                store.close()
+                    raise IOError("{} in {} exists.  Set either overwrite or append option.".format(path, filename))
 
         df = self.to_df()
-        df.to_hdf(filename, path + "/df", format="table")
+        df.to_hdf(filename, key=path + "/df", format="table")
         with pd.HDFStore(filename) as store:
-            # store = pd.HDFStore(filename)
             attrs = store.get_storer(path + "/df").attrs
             attrs.spectroscopy = self.spectroscopy
             attrs.parallax = self.parallax
             attrs.AV = self.AV
             attrs.N = self._N
             attrs.index = self._index
-            store.close()
 
     @classmethod
     def load_hdf(cls, filename, path="", ic=None):
@@ -876,24 +870,23 @@ class ObservationTree(Node):
 
         TODO: saving and loading must be fixed!  save ic type, bands, etc.
         """
-        store = pd.HDFStore(filename)
-        try:
-            samples = store[path + "/df"]
+        with pd.HDFStore(filename, mode="r") as store:
+            df = store[path + "/df"]
             attrs = store.get_storer(path + "/df").attrs
-        except:
-            store.close()
-            raise
-        df = store[path + "/df"]
+            N = attrs.N
+            index = attrs.index
+            spectroscopy = attrs.spectroscopy
+            parallax = attrs.parallax
+            AV = attrs.AV
         new = cls.from_df(df)
 
         if ic is None:
             ic = get_ichrone("mist")
 
-        new.define_models(ic, N=attrs.N, index=attrs.index)
-        new.spectroscopy = attrs.spectroscopy
-        new.parallax = attrs.parallax
-        new.AV = attrs.AV
-        store.close()
+        new.define_models(ic, N=N, index=index)
+        new.spectroscopy = spectroscopy
+        new.parallax = parallax
+        new.AV = AV
         return new
 
     def add_observation(self, obs):
@@ -1122,7 +1115,7 @@ class ObservationTree(Node):
         i = 0
         for s in self.systems:
             age, feh, dist, AV = p[i + N[s] : i + N[s] + 4]
-            for j in xrange(N[s]):
+            for j in range(N[s]):
                 l = "{}_{}".format(s, j)
                 mass = p[i + j]
                 d[l] = [mass, age, feh, dist, AV]
@@ -1147,7 +1140,7 @@ class ObservationTree(Node):
         N = self.Nstars
         pars = []
         for s in self.systems:
-            for j in xrange(N[s]):
+            for j in range(N[s]):
                 pars.append("eep_{}_{}".format(s, j))
             for p in ["age", "feh", "distance", "AV"]:
                 pars.append("{}_{}".format(p, s))
@@ -1257,7 +1250,7 @@ class ObservationTree(Node):
             except AttributeError:
                 pass
 
-        inds = np.argsort(ds)
+        inds = np.argsort(ds, kind="stable")  # ties: keep traversal order (deepest node first)
         ds = [ds[i] for i in inds]
         nodes = [nodes[i] for i in inds]
 

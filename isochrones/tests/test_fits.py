@@ -3,20 +3,26 @@ import numpy as np
 import tempfile
 import tables as tb
 
-from pandas.util.testing import assert_frame_equal
-from flaky import flaky
+from pandas.testing import assert_frame_equal
+
+try:
+    from flaky import flaky
+except ImportError:  # flaky is an optional test dependency
+
+    def flaky(f):
+        return f
+
 
 from isochrones.mist import MIST_Isochrone
 from isochrones import StarModel
 from isochrones.starfit import starfit
 from isochrones.logger import getLogger
 
-mnest = True
-try:
-    import pymultinest
-except:
+from isochrones import starmodel as _starmodel
+
+mnest = _starmodel.pymultinest is not None
+if not mnest:
     getLogger().warning("No PyMultiNest; fits will use emcee")
-    mnest = False
 
 chainsdir = tempfile.gettempdir()
 

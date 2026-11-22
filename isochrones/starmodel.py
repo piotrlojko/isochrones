@@ -1,5 +1,3 @@
-from __future__ import print_function, division
-
 import os, os.path, sys, re, glob
 import itertools
 from copy import deepcopy
@@ -21,18 +19,36 @@ if not on_rtd:
     import emcee
     import corner
 
-    try:
-        import pymultinest
-    except ImportError:
-        logger.warning("PyMultiNest not imported.  MultiNest fits will not work.")
+    def _import_pymultinest():
+        """Import pymultinest without letting a missing MultiNest library kill the interpreter.
+
+        If ``libmultinest`` cannot be loaded, pymultinest prints a banner and
+        calls ``sys.exit(1)`` at import time; turn that into a warning.
+        """
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                import pymultinest
+            return pymultinest
+        except (ImportError, OSError, SystemExit) as e:
+            problem = [l for l in buf.getvalue().splitlines() if l.strip().startswith("problem:")]
+            detail = problem[-1].strip() if problem else repr(e)
+            logger.warning(
+                "PyMultiNest not available ({}).  MultiNest fits will not work; "
+                "use use_emcee=True, or install MultiNest and add its lib/ directory "
+                "to LD_LIBRARY_PATH.".format(detail)
+            )
+            return None
+
+    pymultinest = _import_pymultinest()
 
     import configobj
     from astropy.coordinates import SkyCoord
 
-    try:
-        basestring
-    except NameError:
-        basestring = str
+    basestring = str
 
 from .utils import addmags
 from .observation import ObservationTree, Observation, Source
@@ -334,8 +350,7 @@ class StarModel(object):
         else:
 
             columns = ["name", "band", "resolution", "relative", "separation", "pa", "mag", "e_mag"]
-            df = pd.DataFrame(columns=columns)
-            i = 0
+            rows = []
             for k in c:
                 if type(c[k]) != configobj.Section:
                     kwargs[k] = _parse_config_value(c[k])
@@ -405,8 +420,7 @@ class StarModel(object):
                             row["mag"] = float(mag)
                             row["e_mag"] = float(e_mag)
                             if not np.isnan(row["mag"]) and not np.isnan(row["e_mag"]):
-                                df = df.append(pd.DataFrame(row, index=[i]))
-                                i += 1
+                                rows.append(row)
 
                         # put the reference star in w/ mag=0
                         if relative:
@@ -419,9 +433,9 @@ class StarModel(object):
                             row["pa"] = 0.0
                             row["mag"] = 0.0
                             row["e_mag"] = 0.01
-                            df = df.append(pd.DataFrame(row, index=[i]))
-                            i += 1
+                            rows.append(row)
 
+            df = pd.DataFrame(rows, columns=columns)
             obs = ObservationTree.from_df(df)
 
         if "obsfile" in c:
@@ -751,6 +765,11 @@ class StarModel(object):
             :func:`pymultinest.run`.
 
         """
+        if pymultinest is None:
+            raise ImportError(
+                "PyMultiNest/MultiNest is not available; install MultiNest (and add its lib/ "
+                "directory to LD_LIBRARY_PATH) or fit with use_emcee=True."
+            )
 
         try:
             from mpi4py import MPI
@@ -794,8 +813,10 @@ class StarModel(object):
         else:
             wd = os.getcwd()
             os.chdir(os.path.join(folder, ".."))
-            pymultinest.run(self.mnest_loglike, self.mnest_prior, self.n_params, **mnest_kwargs)
-            os.chdir(wd)
+            try:
+                pymultinest.run(self.mnest_loglike, self.mnest_prior, self.n_params, **mnest_kwargs)
+            finally:
+                os.chdir(wd)
             # with open(propfile, 'w') as f:
             #    json.dump(self.properties, f, indent=2)
 
@@ -951,11 +972,12 @@ class StarModel(object):
             if initial_burn:
                 sampler = emcee.EnsembleSampler(nwalkers, npars, self.lnpost, **kwargs)
                 # ninitial = 300 #should this be parameter?
-                pos, prob, state = sampler.run_mcmc(p0, ninitial)
+                sampler.run_mcmc(p0, ninitial)
 
-                # Choose walker with highest final lnprob to seed new one
-                i, j = np.unravel_index(sampler.lnprobability.argmax(), sampler.shape)
-                p0_best = sampler.chain[i, j, :]
+                # Choose walker with highest lnprob to seed new one
+                log_prob = sampler.get_log_prob()  # (nsteps, nwalkers)
+                i, j = np.unravel_index(np.nanargmax(log_prob), log_prob.shape)
+                p0_best = sampler.get_chain()[i, j, :]
                 logger.debug("After initial burn, p0={}".format(p0_best))
                 p0 = p0_best * (1 + rand.normal(size=p0.shape) * 0.001)
                 logger.debug(p0)
@@ -964,9 +986,9 @@ class StarModel(object):
             p0 = rand.normal(size=(nwalkers, npars)) * 0.01 + p0.T[None, :]
 
         sampler = emcee.EnsembleSampler(nwalkers, npars, self.lnpost)
-        pos, prob, state = sampler.run_mcmc(p0, nburn)
+        state = sampler.run_mcmc(p0, nburn)
         sampler.reset()
-        sampler.run_mcmc(pos, niter, rstate0=state)
+        sampler.run_mcmc(state, niter)
 
         self._sampler = sampler
         return sampler
@@ -997,10 +1019,10 @@ class StarModel(object):
                 logger.error("Error loading chains from {}".format(filename))
                 raise
         else:
-            chain = self.sampler.flatchain
-            lnprob = self.sampler.lnprobability.ravel()
+            chain = self.sampler.get_chain(flat=True)
+            lnprob = self.sampler.get_log_prob(flat=True)
 
-        df = pd.DataFrame()
+        df = pd.DataFrame(index=pd.RangeIndex(len(chain)))
 
         i = 0
         for s, n in self.obs.Nstars.items():
@@ -1145,7 +1167,7 @@ class StarModel(object):
             tot_mag = addmags(*mags)
 
             if n.relative:
-                name = "{} $\Delta${}".format(n.instrument, n.band)
+                name = r"{} $\Delta${}".format(n.instrument, n.band)
                 ref = n.reference
                 if ref is None:
                     continue
@@ -1222,25 +1244,16 @@ class StarModel(object):
             If ``True``, then if a file exists, then just the path
             within the file will be updated.
         """
-        if os.path.exists(filename):
-            with pd.HDFStore(filename) as store:
-                if path in store:
-                    if overwrite:
-                        os.remove(filename)
-                    elif not append:
-                        raise IOError(
-                            "{} in {} exists.  Set either overwrite or append option.".format(path, filename)
-                        )
+        _check_hdf_path(filename, path, overwrite=overwrite, append=append)
 
         if self.samples is not None:
-            self.samples.to_hdf(filename, path + "/samples", format="table")
+            self.samples.to_hdf(filename, key=path + "/samples", format="table")
         else:
-            pd.DataFrame().to_hdf(filename, path + "/samples", format="table")
+            pd.DataFrame().to_hdf(filename, key=path + "/samples", format="table")
 
         self.obs.save_hdf(filename, path + "/obs", append=True)
 
         with pd.HDFStore(filename) as store:
-            # store = pd.HDFStore(filename)
             attrs = store.get_storer("{}/samples".format(path)).attrs
 
             attrs.ic_type = type(self.ic)
@@ -1254,7 +1267,6 @@ class StarModel(object):
             # attrs._priors = self._priors
 
             attrs.name = self.name
-            store.close()
 
     @classmethod
     def load_hdf(cls, filename, path="", name=None):
@@ -1274,35 +1286,29 @@ class StarModel(object):
         """
         if not os.path.exists(filename):
             raise IOError("{} does not exist.".format(filename))
-        store = pd.HDFStore(filename)
-        try:
+        with pd.HDFStore(filename, mode="r") as store:
             samples = store[path + "/samples"]
             attrs = store.get_storer(path + "/samples").attrs
-        except:
-            store.close()
-            raise
 
-        try:
-            ic = attrs.ic_type(attrs.ic_bands)
-        except AttributeError:
-            ic = attrs.ic_type
-
-        use_emcee = attrs.use_emcee
-        mnest = True
-        try:
-            basename = attrs._mnest_basename
-        except AttributeError:
-            mnest = False
-        bounds = attrs._bounds
-        priors = attrs._priors
-
-        if name is None:
             try:
-                name = attrs.name
-            except:
-                name = ""
+                ic = attrs.ic_type(attrs.ic_bands)
+            except AttributeError:
+                ic = attrs.ic_type
 
-        store.close()
+            use_emcee = attrs.use_emcee
+            mnest = True
+            try:
+                basename = attrs._mnest_basename
+            except AttributeError:
+                mnest = False
+            bounds = attrs._bounds
+            priors = attrs._priors
+
+            if name is None:
+                try:
+                    name = attrs.name
+                except AttributeError:
+                    name = ""
 
         obs = ObservationTree.load_hdf(filename, path + "/obs", ic=ic)
 
@@ -1651,12 +1657,16 @@ class BasicStarModel(StarModel):
         return self._derived_samples
 
     def _make_samples(self):
-        filename = "{}post_equal_weights.dat".format(self.mnest_basename)
-        try:
-            df = pd.read_csv(filename, names=self.param_names + ("lnprob",), sep=r"\s+")
-        except OSError:
-            logger.error("Error loading chains from {}".format(filename))
-            raise
+        if self.use_emcee and hasattr(self, "_sampler"):
+            df = pd.DataFrame(self.sampler.get_chain(flat=True), columns=list(self.param_names))
+            df["lnprob"] = self.sampler.get_log_prob(flat=True)
+        else:
+            filename = "{}post_equal_weights.dat".format(self.mnest_basename)
+            try:
+                df = pd.read_csv(filename, names=tuple(self.param_names) + ("lnprob",), sep=r"\s+")
+            except OSError:
+                logger.error("Error loading chains from {}".format(filename))
+                raise
 
         self._samples = df
 
@@ -1714,38 +1724,47 @@ class BasicStarModel(StarModel):
         self._derived_samples["AV"] = df["AV"]
 
     def sample_from_prior(self, n, values=False, require_valid=True):
+        param_names = list(self.param_names)
         if n == 0:
-            return pd.DataFrame(columns=self.param_names)
+            return pd.DataFrame(columns=param_names)
 
-        pars = []
-        columns = []
-        for p in self.param_names:
-            if p != "eep":
-                samples = self._priors[p].sample(n)
-                pars.append(samples)
-                columns.append(p)
-        df = pd.DataFrame(np.array(pars).T, columns=columns)
+        eep_names = [p for p in param_names if p.startswith("eep")]
+        df = pd.DataFrame({p: np.asarray(self._priors[p].sample(n), dtype=float) for p in param_names if p not in eep_names})
 
-        # Resample EEPs with proper weights
+        # Resample (primary) EEPs with proper weights
         if self.ic.eep_replaces == "age":
-            df["eep"] = self._priors["eep"].sample(n, mass=df["mass"], feh=df["feh"])
+            primary = self._priors["eep"].sample(n, mass=df["mass"], feh=df["feh"])
         else:
-            df["eep"] = self._priors["eep"].sample(n, age=df["age"], feh=df["feh"])
+            primary = self._priors["eep"].sample(n, age=df["age"], feh=df["feh"])
+        eep = np.asarray(primary, dtype=float)
+        df[eep_names[0]] = eep
+
+        # Companions (binary/triple models): EEPs below the previous star's,
+        # as required by lnprior (same age, so lower EEP = lower mass).
+        eep_lo = self.bounds("eep")[0]
+        for name in eep_names[1:]:
+            eep = eep_lo + np.random.random(n) * (eep - eep_lo)
+            df[name] = eep
+
+        df = df[param_names]
 
         if require_valid:
-            pars = df[list(self.param_names)].values
+            pars = df.to_numpy()
             lnprob = np.array([self.lnpost(pars[i, :]) for i in range(len(pars))])
             bad = np.logical_not(np.isfinite(lnprob))
             nbad = bad.sum()
             if nbad:
                 new_values = self.sample_from_prior(nbad, require_valid=True)
-                new_values.index = df.iloc[bad, :].index
-                df.iloc[bad, :] = new_values
+                df.iloc[np.flatnonzero(bad), :] = new_values[param_names].to_numpy()
 
         if values:
-            return df[list(self.param_names)].values
+            return df.to_numpy()
         else:
             return df
+
+    def emcee_p0(self, nwalkers):
+        """Initial walker positions for emcee, drawn from the prior (all with finite posterior)."""
+        return self.sample_from_prior(nwalkers, values=True)
 
     def corner_params(self, **kwargs):
         fig = corner.corner(self.samples, labels=self.samples.columns, **kwargs)
@@ -1860,25 +1879,16 @@ class BasicStarModel(StarModel):
             If ``True``, then if a file exists, then just the path
             within the file will be updated.
         """
-        if os.path.exists(filename):
-            with pd.HDFStore(filename) as store:
-                if path in store:
-                    if overwrite:
-                        os.remove(filename)
-                    elif not append:
-                        raise IOError(
-                            "{} in {} exists.  Set either overwrite or append option.".format(path, filename)
-                        )
+        _check_hdf_path(filename, path, overwrite=overwrite, append=append)
 
         if self.samples is not None:
-            self.samples.to_hdf(filename, path + "/samples")
-            self.derived_samples.to_hdf(filename, path + "/derived_samples")
+            self.samples.to_hdf(filename, key=path + "/samples")
+            self.derived_samples.to_hdf(filename, key=path + "/derived_samples")
         else:
-            pd.DataFrame().to_hdf(filename, path + "/samples")
-            pd.Dataframe().to_hdf(filename, path + "/derived_samples")
+            pd.DataFrame().to_hdf(filename, key=path + "/samples")
+            pd.DataFrame().to_hdf(filename, key=path + "/derived_samples")
 
         with pd.HDFStore(filename) as store:
-            # store = pd.HDFStore(filename)
             attrs = store.get_storer("{}/samples".format(path)).attrs
 
             attrs.ic_type = type(self.ic)
@@ -1914,14 +1924,10 @@ class BasicStarModel(StarModel):
         if not os.path.exists(filename):
             raise IOError("{} does not exist.".format(filename))
 
-        with pd.HDFStore(filename) as store:
-            try:
-                samples = store[path + "/samples"]
-                derived_samples = store[path + "/derived_samples"]
-                attrs = store.get_storer(path + "/samples").attrs
-            except:
-                store.close()
-                raise
+        with pd.HDFStore(filename, mode="r") as store:
+            samples = store[path + "/samples"]
+            derived_samples = store[path + "/derived_samples"]
+            attrs = store.get_storer(path + "/samples").attrs
 
             try:
                 ic = attrs.ic_type(attrs.ic_bands)
@@ -1943,10 +1949,8 @@ class BasicStarModel(StarModel):
             if name is None:
                 try:
                     name = attrs.name
-                except:
+                except AttributeError:
                     name = ""
-
-        store.close()
 
         mod = cls(ic, name=name, directory=directory, eep_bounds=eep_bounds, **kwargs)
         mod._samples = samples
@@ -2105,6 +2109,19 @@ class IsoTrackModel(BasicStarModel):
 
 
 ########## Utility functions ###############
+
+
+def _check_hdf_path(filename, path, overwrite=False, append=False):
+    """Handle an existing ``path`` inside ``filename`` before (re)writing it."""
+    if not os.path.exists(filename):
+        return
+    with pd.HDFStore(filename, mode="r") as store:
+        exists = path in store  # note: "" (the root) is always present
+    if exists:
+        if overwrite:
+            os.remove(filename)
+        elif not append:
+            raise IOError("{} in {} exists.  Set either overwrite or append option.".format(path, filename))
 
 
 def N_options(N_stars, max_multiples=1, max_stars=2):

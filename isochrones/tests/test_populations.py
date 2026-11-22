@@ -1,5 +1,6 @@
 import unittest
 
+import pytest
 from pandas.testing import assert_frame_equal
 from scipy.stats import uniform, norm
 from isochrones import get_ichrone
@@ -24,6 +25,7 @@ def old_deredden(ic, pop, accurate=False, **kwargs):
     )
 
 
+@pytest.mark.slow  # needs the MIST evolution tracks
 class PopulationTest(unittest.TestCase):
     def setUp(self):
         mist = get_ichrone("mist")

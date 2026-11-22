@@ -1,10 +1,23 @@
 import re
 
 from ..bc import BolometricCorrectionGrid
+from ..config import MIST_MIRRORS
 
 
 class MISTBolometricCorrectionGrid(BolometricCorrectionGrid):
     name = "mist"
+
+    # Relative locations of the (MIST v1) BC tables on a MIST mirror.  Since the
+    # move to https://mist.science they live under BC_tables/v1/; the original
+    # site (and its Internet Archive snapshots) used BC_tables/.
+    bc_table_paths = ("BC_tables/v1/{phot}.txz", "BC_tables/{phot}.txz")
+
+    def get_tarball_urls(self, phot):
+        return [
+            "{}/{}".format(base.rstrip("/"), path.format(phot=phot))
+            for base in MIST_MIRRORS
+            for path in self.bc_table_paths
+        ]
 
     phot_bands = dict(
         UBVRIplus=[

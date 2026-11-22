@@ -1,28 +1,8 @@
 from .config import on_rtd
 
-import os, re, sys
-import warnings
-import itertools
-import pickle
-
 from .logger import getLogger
 
-try:
-    import holoviews as hv
-except ImportError:
-    getLogger().warning("Holoviews not imported. Some visualizations will not be available.")
-    pass
-
 if not on_rtd:
-    import pandas as pd
-    import numpy as np
-
-    from scipy.interpolate import LinearNDInterpolator as interpnd
-    from scipy.optimize import newton, minimize
-    import numpy.random as rand
-    import matplotlib.pyplot as plt
-    from numba import jit
-
     from astropy import constants as const
 
     # Define useful constants
@@ -30,9 +10,6 @@ if not on_rtd:
     MSUN = const.M_sun.cgs.value
     RSUN = const.R_sun.cgs.value
 
-    # from .extinction import EXTINCTION, LAMBDA_EFF, extcurve, extcurve_0
-    # from .interp import DFInterpolator, searchsorted, find_closest3
-    # from .utils import polyval
     from .models import ModelGridInterpolator
 
 else:
@@ -41,8 +18,6 @@ else:
     RSUN = 6.96e10
 
 from .config import ISOCHRONES
-
-# from .grid import ModelGrid
 
 
 def get_ichrone(models, bands=None, default=False, tracks=False, basic=False, **kwargs):
@@ -57,18 +32,23 @@ def get_ichrone(models, bands=None, default=False, tracks=False, basic=False, **
     if isinstance(models, ModelGridInterpolator):
         return models
 
-    if type(models) is type(type):
+    if isinstance(models, type):
         ichrone = models(bands)
     elif models == "mist":
         if tracks:
-            from isochrones.mist import MIST_EvolutionTrack
+            if basic:
+                from isochrones.mist import MIST_BasicEvolutionTrack
 
-            ichrone = MIST_EvolutionTrack(bands=bands, **kwargs)
+                ichrone = MIST_BasicEvolutionTrack(bands=bands, **kwargs)
+            else:
+                from isochrones.mist import MIST_EvolutionTrack
+
+                ichrone = MIST_EvolutionTrack(bands=bands, **kwargs)
         else:
             if basic:
-                from isochrones.mist import MISTBasic_Isochrone
+                from isochrones.mist import MIST_BasicIsochrone
 
-                ichrone = MISTBasic_Isochrone(bands=bands, **kwargs)
+                ichrone = MIST_BasicIsochrone(bands=bands, **kwargs)
             else:
                 from isochrones.mist import MIST_Isochrone
 

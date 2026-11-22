@@ -41,7 +41,7 @@ def write_samples(mod, df, resultsdir="results"):
     if not os.path.exists(resultsdir):
         os.makedirs(resultsdir)
     samplefile = os.path.join(resultsdir, "{}.h5".format(mod.name))
-    df.to_hdf(samplefile, "samples")
+    df.to_hdf(samplefile, key="samples")
 
 
 def fit_emcee3(

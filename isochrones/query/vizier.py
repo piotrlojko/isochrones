@@ -1,28 +1,186 @@
 import os
-from astroquery.vizier import Vizier
-from astropy.coordinates import SkyCoord
-import astropy.units as u
+import re
+import time
+
 import numpy as np
 import pandas as pd
-from configobj import ConfigObj, Section
+import astropy.units as u
+from astropy.coordinates import SkyCoord
+from astroquery.vizier import VizierClass
 
+from ..config import VIZIER_MIRRORS, DOWNLOAD_TIMEOUT
+from ..logger import getLogger
 from .query import EmptyQueryError
 from .catalog import Catalog
+
+__all__ = [
+    "MirroredVizier",
+    "VizierUnavailableError",
+    "get_vizier_mirrors",
+    "query_region_with_mirrors",
+    "vizier_mirror_status",
+    "VizierCatalog",
+    "TwoMASS",
+    "Tycho2",
+    "WISE",
+    "Gaia",
+]
+
+
+class VizierUnavailableError(ConnectionError):
+    """Raised when a query failed on every configured VizieR mirror."""
+
+
+class MirroredVizier(VizierClass):
+    """``astroquery`` Vizier client that also accepts full ``http(s)://`` server URLs.
+
+    astroquery always talks https to ``vizier_server``; some official VizieR
+    mirrors (NAOJ, China-VO) only answer over plain http, so a server given as
+    ``"http://host"`` is used verbatim.
+    """
+
+    def _server_to_url(self, return_type="votable"):
+        server = self.VIZIER_SERVER
+        if server.startswith(("http://", "https://")):
+            return server.rstrip("/") + "/viz-bin/" + return_type
+        return super()._server_to_url(return_type=return_type)
+
+
+# VizieR reports server-side problems (e.g. "Table or Catalog not found" on a
+# mirror lacking a catalogue, database errors) inside an otherwise valid
+# VOTable, which astroquery turns into an empty result.  Such responses must
+# not be mistaken for a genuinely empty field.
+_VIZIER_ERROR_RE = re.compile(
+    r'<INFO[^>]*\bname="(?:Error|QUERY_STATUS)"[^>]*\bvalue="(?!(?:OK|OVERFLOW)")([^"]*)"', re.IGNORECASE
+)
+
+# Mirrors that failed at the network level are moved to the back of the queue
+# for the rest of the session (so a dead primary does not cost a timeout on
+# every query).
+_dead_mirrors = {}
+_DEAD_MIRROR_TTL = 600.0  # seconds
+
+
+def _server_key(server):
+    return re.sub(r"^https?://", "", server).rstrip("/")
+
+
+def get_vizier_mirrors():
+    """Ordered list of VizieR servers to try.
+
+    Starts from :data:`isochrones.config.VIZIER_MIRRORS` (environment variable
+    ``ISOCHRONES_VIZIER_MIRRORS``); a server explicitly configured for
+    astroquery (``[vizier] server`` in ``astroquery.cfg``) is tried first.
+    Mirrors that recently failed are moved to the end.
+    """
+    mirrors = list(VIZIER_MIRRORS)
+    try:
+        if os.getenv("ISOCHRONES_VIZIER_MIRRORS"):
+            raise LookupError  # explicit isochrones setting wins
+        from astroquery.vizier import conf
+
+        configured = conf.server
+        if isinstance(configured, str) and configured and _server_key(configured) not in map(_server_key, mirrors):
+            mirrors.insert(0, configured)
+        elif isinstance(configured, str) and configured and _server_key(configured) != _server_key(mirrors[0]):
+            # User explicitly prefers one of the known mirrors.
+            idx = [_server_key(m) for m in mirrors].index(_server_key(configured))
+            mirrors.insert(0, mirrors.pop(idx))
+    except Exception:
+        pass
+
+    now = time.time()
+    alive = [m for m in mirrors if now - _dead_mirrors.get(_server_key(m), -np.inf) > _DEAD_MIRROR_TTL]
+    dead = [m for m in mirrors if m not in alive]
+    return alive + dead
+
+
+def _mark_dead(server):
+    _dead_mirrors[_server_key(server)] = time.time()
+
+
+def query_region_with_mirrors(coords, radius, catalog, columns=("**",), mirrors=None, timeout=None, **kwargs):
+    """Run a VizieR cone search, falling back through the mirror list.
+
+    Returns ``(table_list, server)``.  A mirror is skipped if it cannot be
+    reached, returns an HTTP error, or reports a server-side error (e.g. the
+    catalogue is not available there).  A clean empty answer is returned as is.
+    """
+    if mirrors is None:
+        mirrors = get_vizier_mirrors()
+    if timeout is None:
+        timeout = DOWNLOAD_TIMEOUT
+
+    log = getLogger()
+    errors = []
+    for server in mirrors:
+        v = MirroredVizier(columns=list(columns), vizier_server=server, timeout=timeout, **kwargs)
+        try:
+            response = v.query_region_async(coords, radius=radius, catalog=catalog, cache=False)
+            response.raise_for_status()
+        except Exception as e:
+            log.warning("VizieR mirror {} failed ({}); trying next mirror.".format(server, e))
+            errors.append("{}: {}".format(server, e))
+            _mark_dead(server)
+            continue
+
+        server_errors = [m for m in _VIZIER_ERROR_RE.findall(response.text) if m.strip()]
+        if server_errors:
+            msg = server_errors[0].strip()
+            log.warning("VizieR mirror {} reported an error for {} ({}); trying next mirror.".format(server, catalog, msg))
+            errors.append("{}: {}".format(server, msg))
+            continue
+
+        try:
+            result = v._parse_result(response)
+        except Exception as e:
+            log.warning("Could not parse response from VizieR mirror {} ({}); trying next mirror.".format(server, e))
+            errors.append("{}: {}".format(server, e))
+            continue
+
+        return result, server
+
+    raise VizierUnavailableError(
+        "VizieR query for {} failed on all mirrors:\n  {}".format(catalog, "\n  ".join(errors))
+    )
+
+
+def vizier_mirror_status(catalog="2mass", timeout=20):
+    """Check which configured VizieR mirrors currently answer queries.
+
+    Returns a :class:`pandas.DataFrame` with one row per mirror (``ok``,
+    response ``time`` in seconds, and ``error`` message).
+    """
+    coords = SkyCoord(45.0343, 0.2354, unit="deg")
+    rows = []
+    for server in get_vizier_mirrors():
+        t0 = time.time()
+        try:
+            query_region_with_mirrors(coords, 5 * u.arcsec, catalog, columns=("_r",), mirrors=[server], timeout=timeout)
+            rows.append(dict(server=server, ok=True, time=time.time() - t0, error=""))
+        except Exception as e:
+            rows.append(dict(server=server, ok=False, time=time.time() - t0, error=str(e).splitlines()[-1]))
+    return pd.DataFrame(rows)
 
 
 class VizierCatalog(Catalog):
     columns = ("**", "_r", "_RAJ2000", "_DEJ2000")
 
+    #: Server that answered the last query (set after the query runs).
+    server = None
+
     def _run_query(self):
         if self._empty:
             raise EmptyQueryError("{} is empty!".format(self))
-        try:
-            self._table = Vizier(columns=list(self.columns)).query_region(
-                self.query_coords, radius=self.query.radius, catalog=self.vizier_name
-            )[0]
-        except IndexError:
+
+        result, self.server = query_region_with_mirrors(
+            self.query_coords, self.query.radius, self.vizier_name, columns=self.columns
+        )
+        if len(result) == 0:
             self._empty = True
             raise EmptyQueryError("{} returns empty!".format(self))
+
+        self._table = result[0]
         self._coords = SkyCoord(self._table["_RAJ2000"], self._table["_DEJ2000"], unit="deg")
         self._table["PA"] = self.coords.position_angle(self.query_coords).deg
         # self._table['separation'] = self.coords.separation(self.query_coords).arcsec
@@ -33,7 +191,7 @@ class TwoMASS(VizierCatalog):
     vizier_name = "2mass"
     epoch = 2000.0
     bands = {"Jmag": "J", "Hmag": "H", "Kmag": "K"}
-    id_column = "_2MASS"
+    id_column = ("2MASS", "_2MASS")
 
 
 class Tycho2(VizierCatalog):
@@ -138,6 +296,6 @@ class Gaia(VizierCatalog):
         factor = np.where(np.exp(-0.4 * (t["Gmag"] - 19.5)) < 1, 1.0, np.exp(-0.4 * (t["Gmag"] - 19.5)))
         good &= t["chi2AL"] / (t["NgAL"] - 5) < 1.44 * factor
 
-        good = pd.Series(good, dtype=bool)
-        good[np.isnan(good)] = False
-        return good
+        # Masked entries (missing values) fail the cut.
+        good = np.ma.filled(np.ma.asarray(good), False).astype(bool)
+        return pd.Series(good, dtype=bool)

@@ -66,11 +66,3 @@ def get_summary_df(names=None, pool=None, **kwargs):
 
     df = pd.concat(dfs)
     return df
-
-    if filename is None:
-        filename = "summary.h5"
-    df.to_hdf(filename, "df")
-    pool.close()
-
-    print("Summary dataframe written to {}".format(filename))
-    return df

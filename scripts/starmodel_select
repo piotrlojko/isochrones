@@ -29,7 +29,7 @@ if __name__=='__main__':
         evidence = {}
         evidences = []
         for sm in starmodels:
-            m = re.search('{}_starmodel_(\w+)\.h5'.format(args.models), sm)
+            m = re.search(r'{}_starmodel_(\w+)\.h5'.format(args.models), sm)
             if m:
                 name = m.group(1)
                 model = StarModel.load_hdf(sm)

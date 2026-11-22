@@ -9,15 +9,19 @@ import pandas as pd
 from tqdm import tqdm
 from scipy.optimize import curve_fit
 
-from isochrones.config import ISOCHRONES
+from isochrones.config import ISOCHRONES, MIST_MIRRORS
 
 from ..models import StellarModelGrid
 from ..eep import fit_section_poly, eep_fn, eep_jac, eep_fn_p0
-from .eep import max_eep
 from ..interp import DFInterpolator, searchsorted
-from ..utils import polyval
+from ..utils import polyval, grouped_gradient
 from .eep import max_eep
 from ..logger import getLogger
+
+
+def mist_urls(path):
+    """Candidate URLs for a file on the MIST server, one per configured mirror."""
+    return ["{}/{}".format(base.rstrip("/"), path.lstrip("/")) for base in MIST_MIRRORS]
 
 
 class MISTModelGrid(StellarModelGrid):
@@ -98,7 +102,8 @@ class MISTIsochroneGrid(MISTModelGrid):
     default_kwargs = {"version": "1.2", "vvcrit": 0.4, "kind": "full_isos"}
     index_cols = ("log10_isochrone_age_yr", "feh", "EEP")
 
-    filename_pattern = "\.iso"
+    filename_pattern = r"\.iso"
+    tarball_member_pattern = r"\.iso$"
     eep_replaces = "mass"
 
     @property
@@ -113,15 +118,15 @@ class MISTIsochroneGrid(MISTModelGrid):
         filename = self.get_directory_path(**kwargs)
         return "{}.txz".format(filename)
 
+    def get_tarball_urls(self, **kwargs):
+        """Candidate URLs (one per mirror), e.g.
+
+        https://mist.science/data/tarballs_v1.2/MIST_v1.2_vvcrit0.4_full_isos.txz
+        """
+        return mist_urls("data/tarballs_v{version}/MIST_v{version}_vvcrit{vvcrit}_{kind}.txz".format(**self.kwargs))
+
     def get_tarball_url(self, **kwargs):
-        """
-        e.g.
-        http://waps.cfa.harvard.edu/MIST/data/tarballs_v1.2/MIST_v1.2_vvcrit0.4_full_isos.txz
-        """
-        return (
-            "http://waps.cfa.harvard.edu/MIST/data/tarballs"
-            + "_v{version}/MIST_v{version}_vvcrit{vvcrit}_{kind}.txz".format(**self.kwargs)
-        )
+        return self.get_tarball_urls(**kwargs)[0]
 
     @classmethod
     def get_feh(cls, filename):
@@ -237,13 +242,15 @@ class MISTEvolutionTrackGrid(MISTModelGrid):
         basename = self.get_file_basename(feh)
         return os.path.join(self.datadir, basename)
 
-    def get_tarball_url(self, feh):
+    tarball_member_pattern = r"\.track\.eep$"
+
+    def get_tarball_urls(self, feh):
         basename = self.get_file_basename(feh)
         version = self.kwargs["version"]
-        return "http://waps.cfa.harvard.edu/MIST/data/tarballs_v{version}/{basename}.txz".format(
-            version=version, basename=basename
-        )
-        return os.path.join(self.datadir, "{}.txz".format(basename))
+        return mist_urls("data/tarballs_v{version}/{basename}.txz".format(version=version, basename=basename))
+
+    def get_tarball_url(self, feh):
+        return self.get_tarball_urls(feh)[0]
 
     def get_tarball_file(self, feh):
         basename = self.get_file_basename(feh)
@@ -255,7 +262,7 @@ class MISTEvolutionTrackGrid(MISTModelGrid):
 
     @classmethod
     def get_mass(cls, filename):
-        m = re.search("(\d{5})M.track.eep", filename)
+        m = re.search(r"(\d{5})M\.track\.eep", filename)
         if m:
             return float(m.group(1)) / 100.0
         else:
@@ -270,7 +277,7 @@ class MISTEvolutionTrackGrid(MISTModelGrid):
                     line = line.split()
                     eep_first = int(line[2])
                     eep_last = int(line[-1])
-                elif re.match("#\s+ star_age", line):
+                elif re.match(r"#\s+ star_age", line):
                     column_names = line[1:].split()
                     break
         initial_mass = cls.get_mass(filename)
@@ -305,14 +312,14 @@ class MISTEvolutionTrackGrid(MISTModelGrid):
     def df_all_feh(self, feh):
         hdf_filename = self.get_feh_hdf_filename(feh)
         if os.path.exists(hdf_filename):
-            df = pd.read_hdf(hdf_filename, "df")
+            df = pd.read_hdf(hdf_filename, key="df")
         else:
             df = pd.concat([self.to_df(f) for f in self.get_feh_filenames(feh)])
             df["initial_feh"] = feh
             df = df.sort_values(by=list(self.index_cols))
-            df.index = [df[c] for c in self.index_cols]
-            df.to_hdf(hdf_filename, "df")
-            df = pd.read_hdf(hdf_filename, "df")
+            df.index = pd.MultiIndex.from_frame(df[list(self.index_cols)])
+            df.to_hdf(hdf_filename, key="df")
+            df = pd.read_hdf(hdf_filename, key="df")
         return df
 
     def df_all_feh_interpolated(self, feh):
@@ -320,12 +327,13 @@ class MISTEvolutionTrackGrid(MISTModelGrid):
         """
         hdf_filename = self.get_feh_interpolated_hdf_filename(feh)
         if os.path.exists(hdf_filename):
-            df_interp = pd.read_hdf(hdf_filename, "df")
+            df_interp = pd.read_hdf(hdf_filename, key="df")
         else:
             getLogger().info("Interpolating incomplete tracks for feh = {}".format(feh))
             df = self.df_all_feh(feh)
             df_interp = df.copy()
             df_interp["interpolated"] = False
+            new_chunks = []
             masses = df.index.levels[1]
             for i, m in tqdm(
                 enumerate(masses),
@@ -368,23 +376,25 @@ class MISTEvolutionTrackGrid(MISTModelGrid):
                         )
                     )
                     new_eeps = np.arange(n_eep + 1, eep_max + 1)
-                    new_index = pd.MultiIndex.from_product([[feh], [m], new_eeps])
-                    new_data = pd.DataFrame(index=new_index, columns=df_interp.columns, dtype=float)
+                    new_index = pd.MultiIndex.from_product([[feh], [m], new_eeps], names=df.index.names)
 
                     # Interpolate values
                     norm_distance = (m - mlo) / (mhi - mlo)
                     lo_index = pd.MultiIndex.from_product([[feh], [mlo], new_eeps])
                     hi_index = pd.MultiIndex.from_product([[feh], [mhi], new_eeps])
-                    new_data.loc[:, df.columns] = (
-                        df.loc[lo_index, :].values * (1 - norm_distance)
-                        + df.loc[hi_index, :].values * norm_distance
+                    values = (
+                        df.loc[lo_index, :].to_numpy(dtype=float) * (1 - norm_distance)
+                        + df.loc[hi_index, :].to_numpy(dtype=float) * norm_distance
                     )
-                    new_data.loc[:, "interpolated"] = True
-                    df_interp = pd.concat([df_interp, new_data])
+                    new_data = pd.DataFrame(values, index=new_index, columns=df.columns)
+                    new_data["interpolated"] = True
+                    new_chunks.append(new_data)
 
-            df_interp.sort_index(inplace=True)
-            df_interp.to_hdf(hdf_filename, "df")
-            df_interp = pd.read_hdf(hdf_filename, "df")
+            if new_chunks:
+                df_interp = pd.concat([df_interp] + new_chunks)
+            df_interp = df_interp.sort_index()
+            df_interp.to_hdf(hdf_filename, key="df")
+            df_interp = pd.read_hdf(hdf_filename, key="df")
 
         return df_interp
 
@@ -407,7 +417,7 @@ class MISTEvolutionTrackGrid(MISTModelGrid):
 
         if not compute:
             try:
-                dt_deep = pd.read_hdf(filename, "dt_deep")
+                dt_deep = pd.read_hdf(filename, key="dt_deep")
             except Exception:
                 compute = True
 
@@ -415,22 +425,17 @@ class MISTEvolutionTrackGrid(MISTModelGrid):
             # need grid to work with first
             df = self.get_df()
 
-            # Make bucket for derivative to go in
-            df["dt_deep"] = np.nan
+            # Compute derivative d(log age)/d(eep) along each (feh, mass) track.
+            # (Assigning into ``df.loc[f, m]`` slices does not propagate back to
+            # ``df`` under pandas copy-on-write, so build the column explicitly.)
+            dt_deep = pd.Series(
+                grouped_gradient(df, np.log10(df["star_age"].to_numpy(dtype=float)), "eep", desc="Computing dt/deep"),
+                index=df.index,
+                name="dt_deep",
+            )
 
-            # Compute derivative for each (feh, age) isochrone, and fill in
-            for f, m in tqdm(
-                itertools.product(*df.index.levels[:2]),
-                total=len(list(itertools.product(*df.index.levels[:2]))),
-                desc="Computing dt/deep",
-            ):
-                subdf = df.loc[f, m]
-                log_age = np.log10(subdf["star_age"])
-                deriv = np.gradient(log_age, subdf["eep"])
-                subdf.loc[:, "dt_deep"] = deriv
-
-            df.dt_deep.to_hdf(filename, "dt_deep")
-            dt_deep = pd.read_hdf(filename, "dt_deep")
+            dt_deep.to_hdf(filename, key="dt_deep")
+            dt_deep = pd.read_hdf(filename, key="dt_deep")
 
         return dt_deep
 
@@ -442,7 +447,7 @@ class MISTEvolutionTrackGrid(MISTModelGrid):
         fehs = self.df.index.levels[0]
         ms = self.df.index.levels[1]
         columns = ["p{}".format(o) for o in range(order + 1)]
-        p_df = pd.DataFrame(index=pd.MultiIndex.from_product((fehs, ms)), columns=columns)
+        p_df = pd.DataFrame(np.nan, index=pd.MultiIndex.from_product((fehs, ms)), columns=columns)
 
         for feh, m in tqdm(
             itertools.product(fehs, ms),
@@ -462,7 +467,7 @@ class MISTEvolutionTrackGrid(MISTModelGrid):
         fehs = self.df.index.levels[0]
         ms = self.df.index.levels[1]
         columns = ["p5", "p4", "p3", "p2", "p1", "p0", "A", "x0", "tau"]
-        par_df = pd.DataFrame(index=pd.MultiIndex.from_product((fehs, ms)), columns=columns)
+        par_df = pd.DataFrame(np.nan, index=pd.MultiIndex.from_product((fehs, ms)), columns=columns)
         for feh, m in tqdm(
             itertools.product(fehs, ms),
             total=len(fehs) * len(ms),
@@ -480,7 +485,7 @@ class MISTEvolutionTrackGrid(MISTModelGrid):
                 pfit = list(np.polyfit(subdf.age.values[mask], subdf.eep.values[mask], 5)) + last_pfit[-3:]
                 pfit[-3] = 0
             last_pfit = pfit
-            par_df.loc[(feh, m), :] = pfit
+            par_df.loc[(feh, m), :] = np.asarray(pfit, dtype=float)
         return par_df.astype(float)
 
     def write_eep_params(self, orders=None):
@@ -489,10 +494,10 @@ class MISTEvolutionTrackGrid(MISTModelGrid):
 
         p_dfs = [self.fit_eep_section(a, b, order=o) for (a, b), o in zip(self.eep_sections, orders)]
         for df, (a, b) in zip(p_dfs, self.eep_sections):
-            df.to_hdf(self.eep_param_filename, "eep_{:.0f}_{:.0f}".format(a, b))
+            df.astype(float).to_hdf(self.eep_param_filename, key="eep_{:.0f}_{:.0f}".format(a, b))
 
         p_approx_df = self.fit_approx_eep()
-        p_approx_df.to_hdf(self.eep_param_filename, "approx")
+        p_approx_df.to_hdf(self.eep_param_filename, key="approx")
 
     def get_eep_interps(self):
         """Get list of interp functions for piecewise polynomial params
@@ -500,7 +505,7 @@ class MISTEvolutionTrackGrid(MISTModelGrid):
         if not os.path.exists(self.eep_param_filename):
             self.write_eep_params()
 
-        with pd.HDFStore(self.eep_param_filename) as store:
+        with pd.HDFStore(self.eep_param_filename, mode="r") as store:
             interps = [DFInterpolator(store["eep_{:.0f}_{:.0f}".format(a, b)]) for a, b in self.eep_sections]
         return interps
 
@@ -508,7 +513,7 @@ class MISTEvolutionTrackGrid(MISTModelGrid):
         if not os.path.exists(self.eep_param_filename):
             self.write_eep_params()
 
-        with pd.HDFStore(self.eep_param_filename) as store:
+        with pd.HDFStore(self.eep_param_filename, mode="r") as store:
             interp = DFInterpolator(store["approx"])
 
         return interp

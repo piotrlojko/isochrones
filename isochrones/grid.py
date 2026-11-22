@@ -1,8 +1,10 @@
-import pandas as pd
 import os
+import lzma
 import tarfile
 
-from .utils import download_file
+import pandas as pd
+
+from .utils import download_file, check_tarball, extract_tarball
 from .interp import DFInterpolator
 from .logger import getLogger
 
@@ -74,37 +76,64 @@ class Grid(object):
     def get_tarball_url(self, **kwargs):
         raise NotImplementedError
 
+    def get_tarball_urls(self, **kwargs):
+        """List of candidate URLs (mirrors) for the tarball, tried in order.
+
+        Subclasses should override this (or `get_tarball_url` for a single URL).
+        """
+        url = self.get_tarball_url(**kwargs)
+        return [url] if isinstance(url, str) else list(url)
+
     def get_tarball_file(self, **kwargs):
         raise NotImplementedError
+
+    #: Regex that at least one member of a valid tarball must match.
+    #: ``None`` disables the content check (the archive must still be readable).
+    tarball_member_pattern = None
+
+    def get_tarball_member_pattern(self, **kwargs):
+        return self.tarball_member_pattern
+
+    def validate_tarball(self, filename, **kwargs):
+        check_tarball(filename, self.get_tarball_member_pattern(**kwargs))
 
     def download_tarball(self, **kwargs):
         if not os.path.exists(self.datadir):
             os.makedirs(self.datadir)
         tarball = self.get_tarball_file(**kwargs)
         if not os.path.exists(tarball):
-            url = self.get_tarball_url(**kwargs)
-            getLogger().info("Downloading {}...".format(url))
-            download_file(url, tarball)
+            urls = self.get_tarball_urls(**kwargs)
+            download_file(urls, tarball, validate=lambda f: self.validate_tarball(f, **kwargs))
 
-    def extract_tarball(self, **kwargs):
+    def _discard_bad_tarball(self, tarball, reason):
+        bad = tarball + ".invalid"
+        getLogger().error(
+            "{} is not a valid data tarball ({}); moving it to {} and downloading it again.".format(
+                tarball, reason, bad
+            )
+        )
+        os.replace(tarball, bad)
+
+    def extract_tarball(self, _retry=True, **kwargs):
         tarball = self.get_tarball_file(**kwargs)
         if not os.path.exists(tarball):
             self.download_tarball(**kwargs)
 
         try:
-            with tarfile.open(tarball) as tar:
-                getLogger().info("Extracting {}...".format(tarball))
-                tar.extractall(self.datadir)
-        except EOFError:
-            getLogger().error("{} corrupted; deleting and re-downloading.".format(tarball))
-            os.remove(tarball)
-            self.extract_tarball(**kwargs)
+            self.validate_tarball(tarball, **kwargs)
+            getLogger().info("Extracting {}...".format(tarball))
+            extract_tarball(tarball, self.datadir)
+        except (EOFError, ValueError, tarfile.TarError, lzma.LZMAError) as e:
+            if not _retry:
+                raise
+            self._discard_bad_tarball(tarball, e)
+            self.extract_tarball(_retry=False, **kwargs)
 
     def read_hdf(self, orig=False):
         h5file = self.hdf_filename
         try:
             path = "orig" if orig else "df"
-            df = pd.read_hdf(h5file, path)
+            df = pd.read_hdf(h5file, key=path)
         except (FileNotFoundError, KeyError):
             df = self.write_hdf(orig=orig)
         return df
@@ -113,7 +142,7 @@ class Grid(object):
         df = self.get_df(orig=orig)
         h5file = self.hdf_filename
         path = "orig" if orig else "df"
-        df.to_hdf(h5file, path)
+        df.to_hdf(h5file, key=path)
         getLogger().info("{} written to {}.".format(path, h5file))
         return df
 

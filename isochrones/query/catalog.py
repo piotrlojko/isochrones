@@ -72,7 +72,14 @@ class Catalog(object):
         else:
             row = self.closest
 
-        return row[self.id_column]
+        # ``id_column`` may list alternatives: VizieR/astroquery naming of
+        # columns that start with a digit changed over time (e.g. "_2MASS" -> "2MASS").
+        candidates = (self.id_column,) if isinstance(self.id_column, str) else tuple(self.id_column)
+        for col in candidates:
+            if col in row.index:
+                value = row[col]
+                return value.decode() if isinstance(value, bytes) else value
+        raise KeyError("None of the ID columns {} found in {} results.".format(candidates, self.name))
 
     def get_photometry(self, brightest=False, systematic_unc=0.0, convert=True):
         """Returns dictionary of photometry of closest match

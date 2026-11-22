@@ -1,6 +1,16 @@
-numpy
-numba
-nose
-pytables
-pandas
-pyviz
+# Runtime dependencies (mirrors [project.dependencies] in pyproject.toml).
+# Prefer `pip install -e .` (or `pip install -e ".[test,plot]"`).
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+astropy>=5.3
+astroquery>=0.4.7
+numba>=0.58
+tables>=3.8
+emcee>=3.1
+corner>=2.2
+configobj>=5.0
+asciitree
+tqdm>=4.60
+requests>=2.28
+pymultinest>=2.11

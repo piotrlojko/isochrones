@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "isochrones"
+dynamic = ["version"]
+description = "Defines objects for interpolating stellar model grids."
+readme = "README.rst"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Timothy D. Morton", email = "tim.morton@gmail.com" }]
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+# Lower bounds only: the code is tested against the newest releases
+# (numpy 2.5, pandas 3.1, scipy 1.18, astropy 8.0, astroquery 0.4.11,
+# numba 0.68, PyTables 3.11, emcee 3.1) and keeps working on older ones.
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "astropy>=5.3",
+    "astroquery>=0.4.7",
+    "numba>=0.58",
+    "tables>=3.8",
+    "emcee>=3.1",
+    "corner>=2.2",
+    "configobj>=5.0",
+    "asciitree",
+    "tqdm>=4.60",
+    "requests>=2.28",
+    # Python bindings only; the MultiNest library itself must be installed
+    # separately (see the docs).  Fits fall back to emcee without it.
+    "pymultinest>=2.11",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.7", "holoviews>=1.17", "bokeh>=3.0"]
+mpi = ["mpi4py>=3.1"]
+test = ["pytest>=7", "flaky>=3.7"]
+docs = ["sphinx>=7", "nbsphinx", "ipython", "sphinx-rtd-theme"]
+all = ["isochrones[plot,mpi,test]"]
+
+[project.urls]
+Homepage = "https://github.com/timothydmorton/isochrones"
+Documentation = "https://isochrones.readthedocs.io"
+Source = "https://github.com/piotrlojko/isochrones"
+
+[tool.setuptools]
+script-files = [
+    "scripts/starfit",
+    "scripts/batch_starfit",
+    "scripts/starmodel-select",
+    "scripts/starfit-summarize",
+    "scripts/mist-initialize.py",
+]
+
+[tool.setuptools.packages.find]
+include = ["isochrones*"]
+
+[tool.setuptools.package-data]
+isochrones = ["tests/star*/*.ini"]
+
+[tool.setuptools.dynamic]
+version = { attr = "isochrones.version.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["isochrones/tests"]
+markers = [
+    "network: test needs internet access to live services (MIST, VizieR, NED/IRSA)",
+    "slow: test builds or downloads large model grids",
+]
+filterwarnings = [
+    # numba's reflected-list deprecation is triggered inside the jitted
+    # likelihood and is harmless here.
+    "ignore::numba.core.errors.NumbaPendingDeprecationWarning",
+]

@@ -1,9 +1,13 @@
-import pandas as pd
 import os
+import re
 import glob
+import warnings
+
+import pandas as pd
 
 from .config import ISOCHRONES
 from .grid import Grid
+from .logger import getLogger
 
 
 class BolometricCorrectionGrid(Grid):
@@ -71,17 +75,40 @@ class BolometricCorrectionGrid(Grid):
         filename = "feh{0}{1:03.0f}.{2}".format(sign_str, abs(feh) * 100, phot)
         return os.path.join(rootdir, filename)
 
+    @staticmethod
+    def get_table_pattern(phot):
+        """Regex matching the names of the individual BC tables of a photometric system.
+
+        e.g. ``fehm050.UBVRIplus`` or ``fehp025.WISE``.
+        """
+        return re.compile(r"(^|/)feh[mp]\d{{3}}\.{}$".format(re.escape(phot)))
+
+    def get_table_filenames(self, phot):
+        """BC table files for ``phot`` present in the data directory.
+
+        Only files following the ``feh[mp]NNN.<phot>`` naming convention of the
+        BC tables are returned, so unrelated files that happen to share the
+        extension (e.g. MIST v2 isochrones ``*_full.iso.UBVRIplus``) are ignored.
+        """
+        pattern = self.get_table_pattern(phot)
+        return sorted(f for f in glob.glob(os.path.join(self.datadir, "*.{}".format(phot))) if pattern.search(f))
+
     def parse_table(self, filename):
         """Reads text table into dataframe
         """
+        names = None
         with open(filename) as fin:
             for i, line in enumerate(fin):
-                if i == 5:
-                    names = line[1:].split()
+                if not line.startswith("#"):
                     break
-        return pd.read_csv(
-            filename, names=names, sep=r"\s+", comment="#", index_col=self.index_cols
-        )
+                cols = line[1:].split()
+                # The column-name line is the one that starts with the index columns
+                if cols[: len(self.index_cols)] == list(self.index_cols):
+                    names = cols
+                    break
+        if names is None:
+            raise ValueError("{} does not look like a bolometric correction table.".format(filename))
+        return pd.read_csv(filename, names=names, sep=r"\s+", comment="#", index_col=list(self.index_cols))
 
     def get_table(self, phot, feh):
         return self.parse_table(self.get_filename(phot, feh))
@@ -90,29 +117,42 @@ class BolometricCorrectionGrid(Grid):
         return os.path.join(self.datadir, "{}.h5".format(phot))
 
     def get_tarball_url(self, phot):
-        url = "http://waps.cfa.harvard.edu/MIST/BC_tables/{}.txz".format(phot)
-        return url
+        return self.get_tarball_urls(phot)[0]
+
+    def get_tarball_urls(self, phot):
+        raise NotImplementedError
+
+    def get_tarball_member_pattern(self, phot):
+        return self.get_table_pattern(phot)
 
     def get_tarball_file(self, phot):
         return os.path.join(self.datadir, "{}.txz".format(phot))
 
     def get_df(self):
-        df_all = pd.DataFrame()
-        for phot in self.phot_systems:
+        dfs = []
+        for phot in sorted(self.phot_systems):
             hdf_filename = self.get_hdf_filename(phot=phot)
             if not os.path.exists(hdf_filename):
-                filenames = glob.glob(os.path.join(self.datadir, "*.{}".format(phot)))
+                filenames = self.get_table_filenames(phot)
                 if not filenames:
                     self.extract_tarball(phot=phot)
-                    filenames = glob.glob(os.path.join(self.datadir, "*.{}".format(phot)))
+                    filenames = self.get_table_filenames(phot)
+                if not filenames:
+                    raise FileNotFoundError(
+                        "No {} bolometric correction tables found in {}.".format(phot, self.datadir)
+                    )
+                getLogger().info("Parsing {} {} bolometric correction tables...".format(len(filenames), phot))
                 df = pd.concat([self.parse_table(f) for f in filenames]).sort_index()
-                df.to_hdf(hdf_filename, "df")
-            df = pd.read_hdf(hdf_filename)
-            df_all = pd.concat([df_all, df], axis=1)
+                with warnings.catch_warnings():
+                    # "[Fe/H]" is not a valid PyTables natural name; harmless.
+                    warnings.filterwarnings("ignore", message="object name is not a valid Python identifier")
+                    df.to_hdf(hdf_filename, key="df")
+            df = pd.read_hdf(hdf_filename, key="df")
+            dfs.append(df)
+
+        df_all = pd.concat(dfs, axis=1) if dfs else pd.DataFrame()
 
         df_all = df_all.rename(columns={v: k for k, v in self.band_map.items()})
-        for col in df_all.columns:
-            if col not in self.bands:
-                del df_all[col]
+        df_all = df_all[[c for c in df_all.columns if c in self.bands]]
 
         return df_all

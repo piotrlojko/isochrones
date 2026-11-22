@@ -183,7 +183,7 @@ def deredden(pop, accurate=False, **kwargs):
     new_pop = pop.copy()
 
     # All columns that end in _mag, with those last four chars removed
-    bands = [c[:-4] for c in pop.columns if re.search("(\w+)_mag$", c)]
+    bands = [c[:-4] for c in pop.columns if re.search(r"(\w+)_mag$", c)]
 
     new_pop["AV_0"] = 0.0
     new_pop["AV_1"] = 0.0

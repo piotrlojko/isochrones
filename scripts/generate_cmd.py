@@ -87,5 +87,5 @@ if __name__ == '__main__':
     mist = get_ichrone('mist')
 
     stars = sample_stars(mist, args.N)
-    stars.to_hdf(args.output, 'df')
+    stars.to_hdf(args.output, key='df')
 

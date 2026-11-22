@@ -1,13 +1,10 @@
-from __future__ import print_function, division
-
 import numpy as np
 import pandas as pd
 import scipy.stats
 from scipy.stats import uniform, lognorm
 from scipy.integrate import quad
-from scipy.stats._continuous_distns import _norm_pdf, _norm_cdf, _norm_logpdf
+from scipy.special import ndtr as _norm_cdf
 
-import matplotlib.pyplot as plt
 import numba as nb
 from math import log, log10
 
@@ -98,6 +95,8 @@ class Prior(object):
 
         c = (b[:-1] + b[1:]) / 2
         if plot:
+            import matplotlib.pyplot as plt
+
             plt.plot(c, h, "_")
             plt.plot(c, pdf, "x")
         else:

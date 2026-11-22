@@ -589,24 +589,26 @@ class DFInterpolator(object):
 
     def _make_grid(self, df, recalc=False):
         if self.filename is not None and os.path.exists(self.filename) and not recalc:
-            d = np.load(self.filename)
-            grid = d["grid"]
-            columns = d["columns"]
-            if not all(columns == self.columns):
+            with np.load(self.filename) as d:
+                grid = d["grid"]
+                columns = [str(c) for c in d["columns"]]
+            if columns != [str(c) for c in self.columns]:
                 raise ValueError("DataFrame columns do not match columns loaded from full grid!")
         else:
             if not self.is_full:  # Need to make a full grid and pad with nans
-                idx = pd.MultiIndex.from_tuples([ixs for ixs in itertools.product(*df.index.levels)])
+                idx = pd.MultiIndex.from_product(df.index.levels, names=df.index.names)
 
-                # Make an empty dataframe with the completely gridded index, and fill
-                grid_df = pd.DataFrame(index=idx, columns=df.columns)
-                grid_df.loc[df.index] = df
+                # Re-index onto the completely gridded index; missing points become NaN.
+                if df.index.is_unique:
+                    grid_df = df.reindex(idx)
+                else:
+                    grid_df = df[~df.index.duplicated(keep="last")].reindex(idx)
             else:
                 grid_df = df
 
             shape = [len(l) for l in df.index.levels] + [len(df.columns)]
 
-            grid = np.array(grid_df.values, dtype=float).reshape(shape)
+            grid = grid_df.to_numpy(dtype=float, na_value=np.nan).reshape(shape)
 
             if self.filename is not None:
                 np.savez(self.filename, grid=grid, columns=self.columns)

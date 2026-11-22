@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.eggs/
+*.part
+docs/_build/
+.ipynb_checkpoints/
+chains/
+isochrones/tests/star*/*.h5
+isochrones/tests/star*/*.log
+isochrones/tests/star*/*.png

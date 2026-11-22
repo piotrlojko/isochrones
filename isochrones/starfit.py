@@ -5,7 +5,6 @@ from .config import on_rtd
 
 if not on_rtd:
     import tables
-    import matplotlib.pyplot as plt
 
 from configobj import ConfigObj
 from .starmodel import StarModel, BasicStarModel
@@ -138,6 +137,8 @@ def starfit(
                     make_magplot = False
 
             if make_magplot:
+                import matplotlib.pyplot as plt
+
                 fig = mod.mag_plot()
                 plt.savefig(os.path.join(folder, "{}_mags_{}.png".format(models, mult)))
 

@@ -1,0 +1,28 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  offline:
+    # Fast, network-free tests (mirror/download logic, priors, interpolation).
+    # The full suite downloads multi-GB MIST grids; run it locally with `pytest`.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+      - name: Test
+        run: >
+          python -m pytest -v -W error::FutureWarning -W error::DeprecationWarning
+          isochrones/tests/test_mirrors.py isochrones/tests/test_priors.py isochrones/tests/test_interp.py

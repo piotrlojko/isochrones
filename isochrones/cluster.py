@@ -402,8 +402,8 @@ class StarClusterModel(StarModel):
                 getLogger().error("Error loading chains from {}".format(filename))
                 raise
         else:
-            chain = self.sampler.flatchain
-            lnprob = self.sampler.lnprobability.ravel()
+            chain = self.sampler.get_chain(flat=True)
+            lnprob = self.sampler.get_log_prob(flat=True)
 
         df = pd.DataFrame(chain, columns=["age", "feh", "distance", "AV", "alpha", "gamma", "fB"])
         df["lnprob"] = lnprob
@@ -443,10 +443,10 @@ def simulate_cluster(
     distances = distance + np.random.randn(N) * distance_scatter
     for b in bands:
         pri = np.array(
-            [float(iso.interp_mag([e, age, feh, d, AV], [b])[3]) for e, d in zip(pri_eeps, distances)]
+            [iso.interp_mag([e, age, feh, d, AV], [b])[3][0] for e, d in zip(pri_eeps, distances)]
         )
         sec = np.array(
-            [float(iso.interp_mag([e, age, feh, d, AV], [b])[3]) for e, d in zip(sec_eeps, distances)]
+            [iso.interp_mag([e, age, feh, d, AV], [b])[3][0] for e, d in zip(sec_eeps, distances)]
         )
         sec[~is_binary] = np.inf
         mags["{}_mag".format(b)] = addmags(pri, sec)

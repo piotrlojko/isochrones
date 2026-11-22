@@ -8,12 +8,16 @@ import pandas as pd
 from astropy import constants as const
 from tqdm import tqdm
 from scipy.optimize import minimize
-from numba import NumbaPendingDeprecationWarning
+
+try:
+    from numba.core.errors import NumbaPendingDeprecationWarning
+except ImportError:  # pragma: no cover - very old numba
+    from numba import NumbaPendingDeprecationWarning
 
 from .config import ISOCHRONES
 from .interp import DFInterpolator, interp_eep, interp_eeps
 from .mags import interp_mag, interp_mags
-from .utils import addmags
+from .utils import addmags, grouped_gradient
 from .grid import Grid
 
 G = const.G.cgs.value
@@ -96,7 +100,7 @@ class StellarModelGrid(Grid):
         """
         df = pd.concat([self.to_df(f) for f in self.get_filenames()])
         df = df.sort_values(by=list(self.index_cols))
-        df.index = [df[c] for c in self.index_cols]
+        df.index = pd.MultiIndex.from_frame(df[list(self.index_cols)])
         return df
 
     def compute_additional_columns(self, df):
@@ -113,7 +117,7 @@ class StellarModelGrid(Grid):
         """
         df = self.df_all()
         if not orig:
-            df.rename(columns=self.column_map, inplace=True)
+            df = df.rename(columns=self.column_map)
             df = self.compute_additional_columns(df)
             # Select only the columns we want,
             df = df[list(self.default_columns)]
@@ -130,7 +134,7 @@ class StellarModelGrid(Grid):
 
         if not compute:
             try:
-                dm_deep = pd.read_hdf(filename, "dm_deep")
+                dm_deep = pd.read_hdf(filename, key="dm_deep")
             except Exception:
                 compute = True
 
@@ -138,17 +142,17 @@ class StellarModelGrid(Grid):
             # need grid to work with first
             df = self.get_df()
 
-            # Make bucket for derivative to go in
-            df["dm_deep"] = np.nan
+            # Compute derivative d(initial mass)/d(eep) along each (age, feh)
+            # isochrone.  (Assigning into ``df.loc[a, f]`` slices does not
+            # propagate back to ``df`` under pandas copy-on-write.)
+            dm_deep = pd.Series(
+                grouped_gradient(df, df["initial_mass"], "eep", desc="Computing dm/deep"),
+                index=df.index,
+                name="dm_deep",
+            )
 
-            # Compute derivative for each (feh, age) isochrone, and fill in
-            for f, a in itertools.product(*df.index.levels[:2]):
-                subdf = df.loc[f, a]
-                deriv = np.gradient(subdf["initial_mass"], subdf["eep"])
-                subdf.loc[:, "dm_deep"] = deriv
-
-            df.dm_deep.to_hdf(filename, "dm_deep")
-            dm_deep = pd.read_hdf(filename, "dm_deep")
+            dm_deep.to_hdf(filename, key="dm_deep")
+            dm_deep = pd.read_hdf(filename, key="dm_deep")
 
         return dm_deep
 
@@ -188,21 +192,15 @@ class StellarModelGrid(Grid):
                 subdf = self.df.xs((x0, x1), level=(0, 1))
                 xs = subdf[self.eep_replaces].values
                 lengths[i] = len(xs)
-                try:
-                    age_arrays[i, : len(xs)] = xs
-                    dt_deep_arrays[i, : len(xs)] = subdf.dt_deep.values
-                except ValueError:
-                    import pdb
-
-                    pdb.set_trace()
+                age_arrays[i, : len(xs)] = xs
+                dt_deep_arrays[i, : len(xs)] = subdf.dt_deep.values
 
             np.savez(
                 self.array_grid_filename, age=age_arrays, dt_deep=dt_deep_arrays, lengths=lengths.astype(int)
             )
 
-        d = np.load(self.array_grid_filename)
-
-        return d["age"], d["dt_deep"], d["lengths"]
+        with np.load(self.array_grid_filename) as d:
+            return d["age"], d["dt_deep"], d["lengths"]
 
     @property
     def array_grid_filename(self):
@@ -213,21 +211,21 @@ class StellarModelGrid(Grid):
         try:
             return self._age_grid
         except AttributeError:
-            age_grid, dt_deep_grid, lengths = self.get_array_grids()
-            self._age_grid = age_grid
-            self._dt_deep_grid = dt_deep_grid
-            self._array_lengths = lengths
+            self._load_array_grids()
             return self._age_grid
+
+    def _load_array_grids(self):
+        age_grid, dt_deep_grid, lengths = self.get_array_grids()
+        self._age_grid = age_grid
+        self._dt_deep_grid = dt_deep_grid
+        self._array_lengths = lengths
 
     @property
     def dt_deep_grid(self):
         try:
             return self._dt_deep_grid
         except AttributeError:
-            age_grid, dt_deep_grid, lengths = self.get_array_grid()
-            self._age_grid = age_grid
-            self._dt_deep_grid = arrays
-            self._array_lengths = lengths
+            self._load_array_grids()
             return self._dt_deep_grid
 
     @property
@@ -235,10 +233,7 @@ class StellarModelGrid(Grid):
         try:
             return self._array_lengths
         except AttributeError:
-            age_grid, dt_deep_grid, lengths = self.get_array_grid()
-            self._age_grid = age_grid
-            self._dt_deep_grid = arrays
-            self._array_lengths = lengths
+            self._load_array_grids()
             return self._array_lengths
 
     @property
@@ -448,9 +443,10 @@ class ModelGridInterpolator(object):
         if isinstance(props, str):
             props = [props]
         eep = self.get_eep(mass, age, feh, approx=approx)
-        values = self.interp_value([mass, eep, feh])
+        pars = [mass, eep, feh] if self.eep_replaces == "age" else [eep, age, feh]
+        values = self.interp_value(pars, props)
         if np.size(values) == 1:
-            return float(values)
+            return np.asarray(values).item()
         else:
             return values
 
@@ -464,7 +460,7 @@ class ModelGridInterpolator(object):
         pars = [mass, eep, feh, distance, AV]
         _, _, _, mags = self.interp_mag(pars, bands)
         if np.size(mags) == 1:
-            return float(mags)
+            return np.asarray(mags).item()
         else:
             return mags
 
@@ -569,8 +565,8 @@ class ModelGridInterpolator(object):
         if return_object:
             return result
 
-        if result.success and result.fun < resid_tol ** 2:
-            return float(result.x)
+        if result.success and np.asarray(result.fun).item() < resid_tol ** 2:
+            return np.asarray(result.x).item()
         else:
             if return_nan:
                 return np.nan
@@ -594,7 +590,7 @@ class ModelGridInterpolator(object):
     ):
         # Pre-empt potential type/shape issues
         mass, age, feh, distance, AV = [
-            np.atleast_1d(a) if np.size(a) > 1 else float(a)
+            np.atleast_1d(a) if np.size(a) > 1 else np.asarray(a, dtype=float).item()
             for a in np.broadcast_arrays(mass, age, feh, distance, AV)
         ]
 
